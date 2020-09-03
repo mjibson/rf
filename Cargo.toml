@@ -1,0 +1,17 @@
+[package]
+name = "rf"
+version = "0.1.0"
+authors = ["Matt Jibson <matt.jibson@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+anyhow = "1.0"
+chrono = "0.4"
+plotters = "0.2"
+rand = "0.7"
+rust-embed = "5.6"
+tiny_http = "0.7"
+
+[dependencies.rusqlite]
+version = "0.24"
+features = ["bundled"]
