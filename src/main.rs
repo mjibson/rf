@@ -2,16 +2,88 @@
 // Probably just create a dockerfile that can do it
 // cargo build --target=armv7-unknown-linux-gnueabihf
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use chrono::prelude::*;
+use dht22_pi::{read, Reading};
 use plotters::prelude::*;
 use rand::prelude::*;
 use rusqlite::{params, Connection};
+use tiny_http::{Header, Response, Server, StatusCode};
+
 use std::cmp::{max, min};
+use std::collections::HashMap;
 use std::io::Cursor;
 use std::sync::{Arc, Mutex};
+use std::thread::sleep;
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tiny_http::{Header, Response, Server, StatusCode};
+
+fn read_sensor(pin: u8) -> Result<Reading> {
+    let mut i = 0;
+    loop {
+        match read(pin) {
+            Ok(r) => return Ok(r),
+            Err(err) => {
+                if i > 10 {
+                    return Err(anyhow!("could not read pin {}: {:?}", pin, err));
+                }
+                println!("{:?}: sleeping...", err);
+                sleep(Duration::from_secs(5));
+                i += 1;
+            }
+        }
+    }
+}
+
+fn record_sensors(conn: Arc<Mutex<Connection>>) {
+    let pins: HashMap<u8, &str> = [(2, "inside")].iter().cloned().collect();
+    let wait = Duration::from_secs(5);
+    let mut first = true;
+
+    loop {
+        for (pin, name) in &pins {
+            let reading = match read_sensor(*pin) {
+                Ok(r) => r,
+                Err(err) => {
+                    println!("{}, skipping", err);
+                    continue;
+                }
+            };
+            // Ignore first read because it seemed off one time.
+            if first {
+                first = false;
+                continue;
+            }
+            if let Err(err) = record_reading(&conn, name, reading) {
+                println!("could not record in db: {}", err);
+            }
+        }
+        println!("waiting {:?}", wait);
+        sleep(wait);
+    }
+}
+
+fn record_reading(conn: &Arc<Mutex<Connection>>, name: &str, r: Reading) -> Result<()> {
+    dbg!("recording {}: {:?}", name, &r);
+    let conn = conn.lock().unwrap();
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
+    conn.execute(
+        "INSERT INTO readings VALUES (?, ?, ?), (?, ?, ?)",
+        params![
+            format!("temp-{}", name),
+            now,
+            c_to_f(r.temperature),
+            format!("humidity-{}", name),
+            now,
+            r.humidity as f64,
+        ],
+    )?;
+    Ok(())
+}
+
+fn c_to_f(c: f32) -> f64 {
+    (c * 1.8 + 32.0) as f64
+}
 
 fn main() {
     let conn = init_db().unwrap();
@@ -26,6 +98,11 @@ fn main() {
     let server = Arc::new(server);
     let mut guards = Vec::with_capacity(4);
     let conn = Arc::new(Mutex::new(conn));
+
+    let record_conn = Arc::clone(&conn);
+    std::thread::spawn(move || {
+        record_sensors(record_conn);
+    });
 
     for _ in 0..guards.capacity() {
         let server = server.clone();
@@ -93,9 +170,11 @@ fn render(conn: Arc<Mutex<Connection>>, name: &str) -> Result<Response<Cursor<Ve
 
     let mut readings: Vec<(DateTime<Utc>, f64)> = vec![];
     let mut ts_min = Utc::now();
-    let mut ts_max = Utc.timestamp(0, 0);
-    let mut val_min = f64::MAX;
-    let mut val_max = f64::MIN;
+    let mut ts_max = ts_min
+        .checked_sub_signed(chrono::Duration::weeks(1))
+        .unwrap();
+    let mut val_min = 200.0;
+    let mut val_max = -200.0;
     while let Some(row) = rows.next()? {
         let ts = Utc.timestamp(row.get(0)?, 0);
         ts_min = min(ts_min, ts);
@@ -108,7 +187,23 @@ fn render(conn: Arc<Mutex<Connection>>, name: &str) -> Result<Response<Cursor<Ve
             val_max = val;
         }
         readings.push((ts, val));
+        println!("{}, {}", ts, val);
     }
+    if readings.is_empty() || ts_min == ts_max {
+        return Err(anyhow!("no data"));
+    }
+    if val_min == val_max {
+        val_min -= 10.0;
+        val_max += 10.0;
+    }
+    println!(
+        "{}, {}, {}, {}, {}",
+        ts_min,
+        ts_max,
+        val_min,
+        val_max,
+        readings.len()
+    );
 
     let mut data = String::with_capacity(1024);
     {
@@ -137,7 +232,7 @@ fn render(conn: Arc<Mutex<Connection>>, name: &str) -> Result<Response<Cursor<Ve
 fn init_db() -> Result<Connection> {
     let conn = Connection::open_in_memory()?;
     create_db(&conn)?;
-    sample_data(&conn)?;
+    //sample_data(&conn)?;
     Ok(conn)
 }
 
@@ -154,6 +249,7 @@ fn create_db(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+#[allow(dead_code)]
 fn sample_data(conn: &Connection) -> Result<()> {
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
     let mut rng = rand::thread_rng();
@@ -310,7 +406,7 @@ const INDEX: &str = r#"
 	<body>
 		<h3 class="title link-title">
 			<a href="/">
-				cheese cave control
+				cheese cave control BLAH
 			</a>
 		</h3>
 		<div>
