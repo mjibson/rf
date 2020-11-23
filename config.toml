@@ -1,0 +1,15 @@
+sensor_read_freq_secs = 5
+retry_read_secs = 5
+
+[sensors.inside]
+pin = 2
+[[sensors.inside.actions]]
+typ = "temp below"
+value = 48
+action = "disable"
+pin = 4
+[[sensors.inside.actions]]
+typ = "temp above"
+value = 52
+action = "enable"
+pin = 4

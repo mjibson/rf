@@ -1,15 +1,3 @@
-// Try to cross compile with https://github.com/japaric/rust-cross
-// Probably just create a dockerfile that can do it
-// cargo build --target=armv7-unknown-linux-gnueabihf
-
-use anyhow::{anyhow, Result};
-use chrono::prelude::*;
-use dht22_pi::{read, Reading};
-use plotters::prelude::*;
-use rand::prelude::*;
-use rusqlite::{params, Connection};
-use tiny_http::{Header, Response, Server, StatusCode};
-
 use std::cmp::{max, min};
 use std::collections::HashMap;
 use std::io::Cursor;
@@ -18,7 +6,18 @@ use std::thread::sleep;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-fn read_sensor(pin: u8) -> Result<Reading> {
+use anyhow::{anyhow, bail, Result};
+use chrono::prelude::*;
+use dht22_pi::{read, Reading};
+use plotters::prelude::*;
+use rand::prelude::*;
+use rppal::gpio::Gpio;
+use rusqlite::{params, Connection};
+use serde::Deserialize;
+use tiny_http::{Header, Response, Server, StatusCode};
+use url::Url;
+
+fn read_sensor(pin: u8, delay: Duration) -> Result<Reading> {
     let mut i = 0;
     loop {
         match read(pin) {
@@ -28,43 +27,70 @@ fn read_sensor(pin: u8) -> Result<Reading> {
                     return Err(anyhow!("could not read pin {}: {:?}", pin, err));
                 }
                 println!("{:?}: sleeping...", err);
-                sleep(Duration::from_secs(5));
+                sleep(delay);
                 i += 1;
             }
         }
     }
 }
 
-fn record_sensors(conn: Arc<Mutex<Connection>>) {
-    let pins: HashMap<u8, &str> = [(2, "inside")].iter().cloned().collect();
-    let wait = Duration::from_secs(5);
+fn record_sensors(conn: Arc<Mutex<Connection>>, config: &Config) {
+    let wait = config.sensor_read();
     let mut first = true;
 
     loop {
-        for (pin, name) in &pins {
-            let reading = match read_sensor(*pin) {
+        for (name, sensor) in &config.sensors {
+            let mut reading = match read_sensor(sensor.pin, config.retry_read()) {
                 Ok(r) => r,
                 Err(err) => {
                     println!("{}, skipping", err);
                     continue;
                 }
             };
-            // Ignore first read because it seemed off one time.
+            reading.temperature = c_to_f(reading.temperature);
             if first {
-                first = false;
                 continue;
             }
-            if let Err(err) = record_reading(&conn, name, reading) {
+            if let Err(err) = record_reading(&conn, name, &reading) {
                 println!("could not record in db: {}", err);
             }
+            println!("checking {} actions", name);
+            for action in &sensor.actions {
+                let trigger = match action.typ.as_str() {
+                    "temp below" => reading.temperature < action.value,
+                    "temp above" => reading.temperature > action.value,
+                    _ => panic!("unknown typ {}", action.typ),
+                };
+                if !trigger {
+                    continue;
+                }
+                let mut pin = Gpio::new()
+                    .expect("could not get gpio")
+                    .get(action.pin)
+                    .expect("could not get pin")
+                    .into_output();
+                match action.action.as_str() {
+                    "enable" => pin.set_high(),
+                    "disable" => pin.set_low(),
+                    _ => panic!("unknown action {}", action.action),
+                };
+                println!(
+                    "{} pin {} because {} {} {}",
+                    action.action, action.pin, name, action.typ, action.value
+                );
+            }
+        }
+        // Ignore first read because it seemed off one time.
+        if first {
+            first = false;
+            continue;
         }
         println!("waiting {:?}", wait);
         sleep(wait);
     }
 }
 
-fn record_reading(conn: &Arc<Mutex<Connection>>, name: &str, r: Reading) -> Result<()> {
-    dbg!("recording {}: {:?}", name, &r);
+fn record_reading(conn: &Arc<Mutex<Connection>>, name: &str, r: &Reading) -> Result<()> {
     let conn = conn.lock().unwrap();
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
     conn.execute(
@@ -72,7 +98,7 @@ fn record_reading(conn: &Arc<Mutex<Connection>>, name: &str, r: Reading) -> Resu
         params![
             format!("temp-{}", name),
             now,
-            c_to_f(r.temperature),
+            r.temperature as f64,
             format!("humidity-{}", name),
             now,
             r.humidity as f64,
@@ -81,11 +107,45 @@ fn record_reading(conn: &Arc<Mutex<Connection>>, name: &str, r: Reading) -> Resu
     Ok(())
 }
 
-fn c_to_f(c: f32) -> f64 {
-    (c * 1.8 + 32.0) as f64
+fn c_to_f(c: f32) -> f32 {
+    c * 1.8 + 32.0
 }
 
-fn main() {
+#[derive(Deserialize, Debug)]
+struct Config {
+    sensor_read_freq_secs: u64,
+    retry_read_secs: u64,
+    sensors: HashMap<String, Sensor>,
+}
+
+impl Config {
+    fn sensor_read(&self) -> Duration {
+        Duration::from_secs(self.sensor_read_freq_secs)
+    }
+    fn retry_read(&self) -> Duration {
+        Duration::from_secs(self.retry_read_secs)
+    }
+}
+
+#[derive(Deserialize, Debug)]
+struct Sensor {
+    pin: u8,
+    actions: Vec<Action>,
+}
+
+#[derive(Deserialize, Debug)]
+struct Action {
+    typ: String,
+    value: f32,
+    action: String,
+    pin: u8,
+}
+
+fn main() -> Result<()> {
+    let config = std::fs::read("config.toml").expect("could not read config.toml");
+    let config: Config = toml::from_slice(&config).expect("could not parse config.toml");
+    println!("{:?}", config);
+
     let conn = init_db().unwrap();
 
     let port: u16 = std::env::var("PORT")
@@ -101,7 +161,7 @@ fn main() {
 
     let record_conn = Arc::clone(&conn);
     std::thread::spawn(move || {
-        record_sensors(record_conn);
+        record_sensors(record_conn, &config);
     });
 
     for _ in 0..guards.capacity() {
@@ -110,18 +170,19 @@ fn main() {
 
         let guard = std::thread::spawn(move || loop {
             let req = server.recv().unwrap();
-            let url = req.url();
-            let url = url.strip_prefix("/").unwrap_or(url);
-            let idx = url.find('/');
-            let (first, second) = match idx {
-                Some(n) => (&url[..n], &url[n + 1..]),
-                None => (&url[..], ""),
+            let url = format!("http://{}{}", req.remote_addr(), req.url());
+            println!("req: {}", url);
+            let url = match Url::parse(&url) {
+                Ok(url) => url,
+                Err(err) => {
+                    println!("{}", err);
+                    continue;
+                }
             };
             let req_conn = Arc::clone(&thread_conn);
-            println!("req: {}, {}.", first, second);
-            let resp = match first {
-                "" => index(),
-                "render" => render(req_conn, second),
+            let resp = match url.path() {
+                "/" => index(),
+                "/render" => render(req_conn, url.query_pairs()),
                 p @ _ => {
                     Ok(Response::from_string(format!("unknown path: {}", p)).with_status_code(404))
                 }
@@ -144,6 +205,8 @@ fn main() {
     for t in guards {
         t.join().unwrap();
     }
+
+    Ok(())
 }
 
 fn html_response<D: Into<Vec<u8>>>(data: D) -> Response<Cursor<Vec<u8>>> {
@@ -163,54 +226,78 @@ fn index() -> Result<Response<Cursor<Vec<u8>>>> {
     Ok(html_response(INDEX))
 }
 
-fn render(conn: Arc<Mutex<Connection>>, name: &str) -> Result<Response<Cursor<Vec<u8>>>> {
-    let conn = conn.lock().unwrap();
-    let mut stmt = conn.prepare("SELECT ts, value FROM readings WHERE name = ?")?;
-    let mut rows = stmt.query(params![name])?;
+fn render(
+    conn: Arc<Mutex<Connection>>,
+    query: url::form_urlencoded::Parse<'_>,
+) -> Result<Response<Cursor<Vec<u8>>>> {
+    let mut names = vec![];
+    let mut xmax = None;
+    let mut xmin = None;
+    let mut title = None;
+    for (key, val) in query {
+        match key.to_string().as_str() {
+            "name" => names.push(val),
+            "xmin" => xmin = Some(val.parse::<f64>()?),
+            "xmax" => xmax = Some(val.parse::<f64>()?),
+            "title" => title = Some(val),
+            _ => bail!("unknown render key {}", key),
+        }
+    }
 
-    let mut readings: Vec<(DateTime<Utc>, f64)> = vec![];
+    let conn = conn.lock().unwrap();
     let mut ts_min = Utc::now();
     let mut ts_max = ts_min
         .checked_sub_signed(chrono::Duration::weeks(1))
         .unwrap();
     let mut val_min = 200.0;
     let mut val_max = -200.0;
-    while let Some(row) = rows.next()? {
-        let ts = Utc.timestamp(row.get(0)?, 0);
-        ts_min = min(ts_min, ts);
-        ts_max = max(ts_max, ts);
-        let val: f64 = row.get(1)?;
-        if val < val_min {
-            val_min = val;
+    let mut series = HashMap::new();
+
+    for name in names {
+        let mut stmt = conn.prepare("SELECT ts, value FROM readings WHERE name = ?")?;
+        let mut rows = stmt.query(params![name])?;
+
+        let mut readings: Vec<(DateTime<Utc>, f64)> = vec![];
+        while let Some(row) = rows.next()? {
+            let ts = Utc.timestamp(row.get(0)?, 0);
+            ts_min = min(ts_min, ts);
+            ts_max = max(ts_max, ts);
+            let val: f64 = row.get(1)?;
+            if val < val_min {
+                val_min = val;
+            }
+            if val > val_max {
+                val_max = val;
+            }
+            readings.push((ts, val));
         }
-        if val > val_max {
-            val_max = val;
+        if readings.is_empty() || ts_min == ts_max {
+            return Err(anyhow!("no data"));
         }
-        readings.push((ts, val));
-        println!("{}, {}", ts, val);
+        if val_min == val_max {
+            val_min -= 10.0;
+            val_max += 10.0;
+        }
+        series.insert(name, readings);
     }
-    if readings.is_empty() || ts_min == ts_max {
-        return Err(anyhow!("no data"));
+
+    if let Some(xmax) = xmax {
+        val_max = xmax;
     }
-    if val_min == val_max {
-        val_min -= 10.0;
-        val_max += 10.0;
+    if let Some(xmin) = xmin {
+        val_min = xmin;
     }
-    println!(
-        "{}, {}, {}, {}, {}",
-        ts_min,
-        ts_max,
-        val_min,
-        val_max,
-        readings.len()
-    );
+    let title = match title {
+        Some(title) => title,
+        None => bail!("no title"),
+    };
 
     let mut data = String::with_capacity(1024);
     {
         let root = SVGBackend::with_string(&mut data, (640, 480)).into_drawing_area();
         root.fill(&WHITE)?;
         let mut chart = ChartBuilder::on(&root)
-            .caption(name, ("sans-serif", 30).into_font())
+            .caption(title, ("sans-serif", 30).into_font())
             .margin(5)
             .x_label_area_size(30)
             .y_label_area_size(30)
@@ -221,13 +308,28 @@ fn render(conn: Arc<Mutex<Connection>>, name: &str) -> Result<Response<Cursor<Ve
             .x_label_formatter(&|d| d.format("%a %R").to_string())
             .draw()?;
 
-        chart.draw_series(LineSeries::new(readings, &RED))?;
+        let mut i = 0;
+        for (name, data) in series {
+            let color = &COLORS[i % COLORS.len()];
+            i += 1;
+            chart
+                .draw_series(LineSeries::new(data, color))?
+                .label(name)
+                .legend(move |(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], color));
+        }
+        chart
+            .configure_series_labels()
+            .position(SeriesLabelPosition::UpperLeft)
+            .border_style(&BLACK)
+            .draw()?;
     }
 
     Ok(Response::from_data(data).with_header(
         tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"image/svg+xml"[..]).unwrap(),
     ))
 }
+
+static COLORS: [RGBColor; 2] = [RGBColor(114, 165, 83), RGBColor(202, 85, 114)];
 
 fn init_db() -> Result<Connection> {
     let conn = Connection::open_in_memory()?;
@@ -263,7 +365,7 @@ fn sample_data(conn: &Connection) -> Result<()> {
             params![now - (i * 60 * 5), t1],
         )?;
         conn.execute(
-            r#"INSERT INTO readings VALUES ("temp-outside", ?, ?);"#,
+            r#"INSERT INTO readings VALUES ("humidity-inside", ?, ?);"#,
             params![now - (i * 60 * 5), t2],
         )?;
     }
@@ -406,12 +508,11 @@ const INDEX: &str = r#"
 	<body>
 		<h3 class="title link-title">
 			<a href="/">
-				cheese cave control BLAH
+				cheese cave control
 			</a>
 		</h3>
 		<div>
-			<img src="/render/temp-inside" alt="inside temp" class="img" />
-			<img src="/render/temp-outside" alt="inside temp" class="img" />
+			<img src="/render?name=temp-inside&name=humidity-inside&xmin=0&xmax=100&title=inside" alt="inside" class="img" />
 		</div>
 	</body>
 </html>

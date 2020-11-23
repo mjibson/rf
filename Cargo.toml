@@ -9,7 +9,11 @@ anyhow = "1.0"
 chrono = "0.4"
 dht22_pi = "0.3"
 rand = "0.7"
+rppal = "0.11"
+serde = { version = "1.0", features = ["derive"] }
 tiny_http = "0.7"
+toml = "0.5"
+url = "2"
 
 # Disable default features to exclude font-kit, which requires
 # servo-fontconfig, which doesn't easily compile with cross.
